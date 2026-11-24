@@ -6,7 +6,7 @@
   "description": "reedline (helix/vi) input editor for pi",
   "keywords": ["pi-package"],
   "pi": {
-    "extensions": ["./src/extension.ts"]
+    "extensions": ["./src/pi-helix.ts"]
   },
   "scripts": {
     "prepare:reedline": "node scripts/prepare-reedline.mjs",
