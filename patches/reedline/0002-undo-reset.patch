@@ -1,0 +1,63 @@
+diff --git a/src/core_editor/edit_stack.rs b/src/core_editor/edit_stack.rs
+index 5467328..a40fb64 100644
+--- a/src/core_editor/edit_stack.rs
++++ b/src/core_editor/edit_stack.rs
+@@ -54,9 +54,14 @@ where
+ 
+     /// Reset the stack to the initial state
+     pub(super) fn reset(&mut self) {
++        self.reset_to(T::default());
++    }
++
++    /// Clear both directions, keeping the supplied state as the baseline.
++    pub(super) fn reset_to(&mut self, current: T) {
+         self.undo.clear();
+         self.redo.clear();
+-        self.current = T::default();
++        self.current = current;
+     }
+ 
+     /// Return the entry currently being pointed to
+diff --git a/src/core_editor/editor.rs b/src/core_editor/editor.rs
+index cf761f3..78c57e9 100644
+--- a/src/core_editor/editor.rs
++++ b/src/core_editor/editor.rs
+@@ -904,6 +904,11 @@ impl Editor {
+         self.edit_stack.reset();
+     }
+ 
++    pub(crate) fn clear_undo_history(&mut self) {
++        self.edit_stack.reset_to(self.line_buffer.clone());
++        self.last_undo_behavior = UndoBehavior::CreateUndoPoint;
++    }
++
+     pub(crate) fn move_to_start(&mut self, select: bool) {
+         self.move_head_to(0, select);
+     }
+diff --git a/src/engine.rs b/src/engine.rs
+index 650b4df..75569ed 100644
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -2750,6 +2750,22 @@ impl Reedline {
+         }
+     }
+ 
++    /// Replace the entire input buffer as one undoable edit, placing the caret
++    /// at the end under the current mode's cursor policy. Does not output itself.
++    pub fn replace_buffer(&mut self, buffer: String) {
++        self.editor.sync_edit_mode(self.edit_mode.edit_mode());
++        self.editor.line_buffer_mut().clear_selection();
++        self.editor.set_buffer(buffer, UndoBehavior::CreateUndoPoint);
++        if self.input_mode == InputMode::HistoryTraversal {
++            self.input_mode = InputMode::Regular;
++        }
++    }
++
++    /// Clear undo and redo history without changing the current edit state.
++    pub fn clear_undo(&mut self) {
++        self.editor.clear_undo_history();
++    }
++
+     /// Executes [`EditCommand`] actions by modifying the internal state appropriately. Does not output itself.
+     pub fn run_edit_commands(&mut self, commands: &[EditCommand]) {
+         self.run_edit_commands_with_status(commands);

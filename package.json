@@ -1,0 +1,21 @@
+{
+  "name": "pi-helix",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "reedline (helix/vi) input editor for pi",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./src/extension.ts"]
+  },
+  "scripts": {
+    "prepare:reedline": "node scripts/prepare-reedline.mjs",
+    "build:native": "node scripts/prepare-reedline.mjs && cargo build --locked --release -p pi-reedline && node scripts/copy-native.mjs",
+    "test": "bun test",
+    "check": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}

@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/pi-reedline"]
+exclude = [".reedline/reedline"]
+
+[profile.release]
+lto = true
+strip = true

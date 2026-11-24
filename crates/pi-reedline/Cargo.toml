@@ -1,0 +1,21 @@
+[package]
+name = "pi-reedline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["napi-bindings"]
+napi-bindings = ["dep:napi", "dep:napi-derive"]
+
+[dependencies]
+reedline = { path = "../../.reedline/reedline" }
+crossterm = { version = "0.29", default-features = false }
+napi = { version = "3", default-features = false, features = ["napi6"], optional = true }
+napi-derive = { version = "3", optional = true }
+
+[build-dependencies]
+napi-build = "2"

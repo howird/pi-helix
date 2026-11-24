@@ -1,0 +1,276 @@
+diff --git a/src/edit_mode/base.rs b/src/edit_mode/base.rs
+index 517108b..1f76fab 100644
+--- a/src/edit_mode/base.rs
++++ b/src/edit_mode/base.rs
+@@ -1,3 +1,5 @@
++use crossterm::event::KeyEvent;
++
+ use crate::{
+     enums::{EventStatus, ReedlineEvent, ReedlineRawEvent},
+     PromptEditMode,
+@@ -15,6 +17,17 @@ pub trait EditMode: Send {
+     /// What to display in the prompt indicator
+     fn edit_mode(&self) -> PromptEditMode;
+ 
++    /// Whether the parser is waiting for more input to complete a key sequence.
++    /// Modes without partial sequences can use the default.
++    fn has_pending_sequence(&self) -> bool {
++        false
++    }
++
++    /// The original key events of the unfinished sequence, in input order.
++    fn pending_keys(&self) -> Vec<KeyEvent> {
++        Vec::new()
++    }
++
+     /// Handles events that apply only to specific edit modes.
+     ///
+     /// This is also how a [`ReedlineEvent::SwitchMode`] finds its machine. The
+diff --git a/src/edit_mode/helix/mod.rs b/src/edit_mode/helix/mod.rs
+index ef0104b..09fda1b 100644
+--- a/src/edit_mode/helix/mod.rs
++++ b/src/edit_mode/helix/mod.rs
+@@ -181,6 +181,8 @@ pub struct Helix {
+     count: Option<usize>,
+     /// Prefix key waiting for its argument (`f`/`r`/`g`/`m`).
+     pending: Option<Pending>,
++    /// Original events for the count and prefix, before semantic parsing.
++    pending_keys: Vec<KeyEvent>,
+ }
+ 
+ impl EditMode for Helix {
+@@ -200,14 +202,22 @@ impl EditMode for Helix {
+             HelixMode::Select => PromptEditMode::Helix(PromptHelixMode::Select),
+         }
+     }
++
++    fn has_pending_sequence(&self) -> bool {
++        self.pending.is_some() || self.count.is_some()
++    }
++
++    fn pending_keys(&self) -> Vec<KeyEvent> {
++        self.pending_keys.clone()
++    }
++
+     fn handle_mode_specific_event(&mut self, event: ReedlineEvent) -> EventStatus {
+         match event {
+             ReedlineEvent::SwitchMode(PromptEditMode::Helix(target)) => {
+                 // `dispatch` drops the sequence before a bound chord fires, so
+                 // no binding gets here with one armed. Reset anyway, rather
+                 // than lean on that guarantee from over here.
+-                self.pending = None;
+-                self.count = None;
++                self.clear_pending();
+                 self.mode = HelixMode::from(target);
+                 EventStatus::Handled
+             }
+@@ -261,6 +271,12 @@ impl Helix {
+         }
+     }
+ 
++    fn clear_pending(&mut self) {
++        self.pending = None;
++        self.count = None;
++        self.pending_keys.clear();
++    }
++
+     fn dispatch(&mut self, key: KeyEvent) -> ReedlineEvent {
+         // Insert should never use this code-path.
+         debug_assert!(self.mode != HelixMode::Insert);
+@@ -282,8 +298,7 @@ impl Helix {
+         };
+         if !claimed {
+             if let Some(event) = self.keybindings().find_binding(key.modifiers, key.code) {
+-                self.pending = None;
+-                self.count = None;
++                self.clear_pending();
+                 return event;
+             }
+         }
+@@ -304,6 +319,7 @@ impl Helix {
+                         .saturating_add(c.to_digit(10).unwrap_or(0) as usize)
+                         .min(u16::MAX as usize),
+                 );
++                self.pending_keys.push(key);
+                 return ReedlineEvent::None;
+             }
+             // Unbound or claimed, so the helix machine reads it.
+@@ -313,10 +329,11 @@ impl Helix {
+         match outcome {
+             Outcome::Absorb(pending) => {
+                 self.pending = Some(pending);
++                self.pending_keys.push(key);
+                 ReedlineEvent::None
+             }
+             Outcome::Execute(action) => {
+-                self.count = None;
++                self.clear_pending();
+                 let event = lower(action, self.mode);
+                 if let Some(next_mode) = action.next_mode {
+                     self.mode = next_mode;
+@@ -324,7 +341,7 @@ impl Helix {
+                 event
+             }
+             Outcome::Reject => {
+-                self.count = None;
++                self.clear_pending();
+                 ReedlineEvent::None
+             }
+         }
+@@ -359,6 +376,7 @@ impl Default for Helix {
+             mode: HelixMode::Insert,
+             count: None,
+             pending: None,
++            pending_keys: Vec::new(),
+         }
+     }
+ }
+diff --git a/src/edit_mode/vi/mod.rs b/src/edit_mode/vi/mod.rs
+index 3927491..17c6e62 100644
+--- a/src/edit_mode/vi/mod.rs
++++ b/src/edit_mode/vi/mod.rs
+@@ -40,7 +40,8 @@ impl From<PromptViMode> for ViMode {
+ /// insert. Binding the Alt chord itself takes precedence and is the per-key
+ /// opt-out.
+ pub struct Vi {
+-    cache: Vec<char>,
++    // The normalized parser token and the original key that produced it.
++    cache: Vec<(char, KeyEvent)>,
+     insert_keybindings: Keybindings,
+     normal_keybindings: Keybindings,
+     visual_keybindings: Keybindings,
+@@ -98,9 +99,7 @@ impl Vi {
+ impl EditMode for Vi {
+     fn parse_event(&mut self, event: ReedlineRawEvent) -> ReedlineEvent {
+         match event.into() {
+-            Event::Key(KeyEvent {
+-                code, modifiers, ..
+-            }) => self.dispatch_key(modifiers, code),
++            Event::Key(key) => self.dispatch_key(key),
+             event => parse_non_key_event(event),
+         }
+     }
+@@ -115,6 +114,14 @@ impl EditMode for Vi {
+         }
+     }
+ 
++    fn has_pending_sequence(&self) -> bool {
++        !self.cache.is_empty()
++    }
++
++    fn pending_keys(&self) -> Vec<KeyEvent> {
++        self.cache.iter().map(|&(_, key)| key).collect()
++    }
++
+     fn handle_mode_specific_event(&mut self, event: ReedlineEvent) -> EventStatus {
+         match event {
+             ReedlineEvent::SwitchMode(PromptEditMode::Vi(target)) => {
+@@ -146,13 +153,18 @@ fn with_trailing_repaint(event: ReedlineEvent) -> ReedlineEvent {
+ 
+ impl Vi {
+     /// Route one keypress: the meta prefix first, then the mode's own grammar
+-    /// and tables. A method rather than the body of `parse_event` so the meta
+-    /// path can re-dispatch the stripped key without a raw-event round trip.
+-    fn dispatch_key(&mut self, modifiers: KeyModifiers, code: KeyCode) -> ReedlineEvent {
+-        if let Some(event) = self.meta_as_escape(modifiers, code) {
++    /// and tables.
++    fn dispatch_key(&mut self, key: KeyEvent) -> ReedlineEvent {
++        if let Some(event) = self.meta_as_escape(key) {
+             return event;
+         }
++        self.dispatch_key_as(key, key.modifiers)
++    }
+ 
++    // The grammar may see stripped modifiers on the meta path, but the cache
++    // always retains the original key.
++    fn dispatch_key_as(&mut self, key: KeyEvent, modifiers: KeyModifiers) -> ReedlineEvent {
++        let code = key.code;
+         match (self.mode, modifiers, code) {
+             // TODO: This guard changes `2v`: the pending count keeps `cache`
+             // non-empty, so `v` no longer enters Visual mode. Decide how
+@@ -176,13 +188,15 @@ impl Vi {
+                 // before a custom keybinding can claim the next key; otherwise a
+                 // binding on that second key would hijack the sequence.
+                 if !self.cache.is_empty() || (binding.is_none() && is_typeable) {
+-                    self.cache.push(if modifier == KeyModifiers::SHIFT {
++                    let token = if modifier == KeyModifiers::SHIFT {
+                         c.to_ascii_uppercase()
+                     } else {
+                         c
+-                    });
++                    };
++                    self.cache.push((token, key));
+ 
+-                    let res = parse(self.mode, &mut self.cache.iter().peekable());
++                    let mut tokens = self.cache.iter().map(|(token, _)| token).peekable();
++                    let res = parse(self.mode, &mut tokens);
+ 
+                     if !res.is_valid() {
+                         self.cache.clear();
+@@ -261,6 +275,7 @@ impl Vi {
+                     None => {
+                         // Default Enter behavior when no custom binding
+                         if modifiers == KeyModifiers::NONE && code == KeyCode::Enter {
++                            self.cache.clear();
+                             self.mode = ViMode::Insert;
+                             // The normal/visual block caret rests *on* a grapheme;
+                             // submitting (or inserting a newline on incomplete input)
+@@ -318,7 +333,10 @@ impl Vi {
+     /// Alt chord wins (the per-key opt-out), Alt on a non-character key is
+     /// left to the tables, and the Ctrl-Alt pairs some terminals report for
+     /// AltGr stay typed text via [`is_text_char`].
+-    fn meta_as_escape(&mut self, modifiers: KeyModifiers, code: KeyCode) -> Option<ReedlineEvent> {
++    fn meta_as_escape(&mut self, key: KeyEvent) -> Option<ReedlineEvent> {
++        let KeyEvent {
++            code, modifiers, ..
++        } = key;
+         let KeyCode::Char(c) = code else {
+             return None;
+         };
+@@ -338,9 +356,7 @@ impl Vi {
+         }
+ 
+         let mut events = self.escape();
+-        // The stripped key can no longer satisfy `is_meta_char`, so this
+-        // re-dispatch cannot loop back here.
+-        match self.dispatch_key(modifiers.difference(KeyModifiers::ALT), code) {
++        match self.dispatch_key_as(key, modifiers.difference(KeyModifiers::ALT)) {
+             ReedlineEvent::None => {}
+             event => events.push(event),
+         }
+@@ -887,7 +903,10 @@ mod test {
+         let result = vi.parse_event(key(KeyCode::Char('d'), KeyModifiers::NONE));
+ 
+         assert_eq!(result, ReedlineEvent::None);
+-        assert_eq!(vi.cache, vec!['d']);
++        assert_eq!(
++            vi.cache,
++            vec![('d', KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))]
++        );
+     }
+ 
+     #[test]
+@@ -1255,7 +1274,10 @@ mod test {
+         let result = vi.parse_event(key(KeyCode::Char('2'), KeyModifiers::NONE));
+ 
+         assert_eq!(result, ReedlineEvent::None);
+-        assert_eq!(vi.cache, vec!['2']);
++        assert_eq!(
++            vi.cache,
++            vec![('2', KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))]
++        );
+     }
+ 
+     #[test]
+@@ -1265,7 +1287,10 @@ mod test {
+             ..Default::default()
+         };
+         let _ = vi.parse_event(key(KeyCode::Char('d'), KeyModifiers::NONE));
+-        assert_eq!(vi.cache, vec!['d']);
++        assert_eq!(
++            vi.cache,
++            vec![('d', KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))]
++        );
+ 
+         let result = vi.parse_event(key(KeyCode::Char('z'), KeyModifiers::NONE));
+ 

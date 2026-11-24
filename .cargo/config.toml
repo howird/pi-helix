@@ -1,0 +1,3 @@
+[alias]
+# napi symbols only resolve inside node; test the engine without the bindings.
+t = "test -p pi-reedline --no-default-features"

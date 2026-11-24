@@ -1,0 +1,6 @@
+/target
+/.reedline/
+/node_modules
+/result
+/pi_reedline.node
+/pi_reedline.node.tmp
