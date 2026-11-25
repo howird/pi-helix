@@ -68,6 +68,6 @@ bun test
 bun run check
 ```
 
-`patches/reedline/revision` pins the upstream source. Local and Nix builds apply the same two
+`patches/reedline/revision` pins the upstream source. Local and Nix builds apply the same
 patches; no Reedline source tree or fork is maintained here. After updating the pin or a patch,
 rerun `bun run prepare:reedline` before running Cargo directly.

@@ -1,0 +1,292 @@
+diff --git a/src/core_editor/editor.rs b/src/core_editor/editor.rs
+--- a/src/core_editor/editor.rs
++++ b/src/core_editor/editor.rs
+@@ -28,11 +28,10 @@
+     edit_stack: EditStack<LineBuffer>,
+     last_undo_behavior: UndoBehavior,
+     edit_mode: PromptEditMode,
+-    /// Set when [`sync_edit_mode`](Self::sync_edit_mode) adopts a new rest
+-    /// policy without committing the cursor; cleared at the commit boundary.
+-    /// Lets the pre-paint sweep settle a command-less mode transition that
+-    /// would otherwise never re-normalize under the new policy.
+-    policy_unsettled: bool,
++    /// Policy that shaped the cursor before an unsettled mode transition.
++    /// The new policy governs placement, but does not necessarily describe
++    /// the range that a transition command reads as its origin.
++    previous_rest_policy: Option<RestPolicy>,
+     /// When `true`, a grapheme left/right motion under a block caret (vi normal)
+     /// crosses line terminators — `l` at a line's end lands on the next line's
+     /// first grapheme, `h` at column 0 on the previous line's last. When `false`
+@@ -81,7 +80,7 @@
+             edit_stack: EditStack::new(),
+             last_undo_behavior: UndoBehavior::CreateUndoPoint,
+             edit_mode: PromptEditMode::Default,
+-            policy_unsettled: false,
++            previous_rest_policy: None,
+             cross_line_cursor: true,
+         }
+     }
+@@ -144,6 +143,13 @@
+             // `put_cursor` can see. Helix lowers its own (`gs`) through
+             // `put_cursor` in select mode too, so take that path either way.
+             EditCommand::Extend(t) if t.direction().is_none() => self.apply_move(*t, true),
++            // A line edge is a destination on the active caret's line. Using
++            // the selection head can start on the next line if it covers LF.
++            EditCommand::Extend(t @ MotionTarget::LineEdge(_))
++                if self.edit_mode.rest_policy().covers_terminator() =>
++            {
++                self.apply_move(*t, true);
++            }
+             EditCommand::Extend(t) => match self.caret_extent() {
+                 SelectionExtent::CoverLanding => self.apply_move(*t, true),
+                 // Backward travel departs from the visible caret, which under a
+@@ -276,8 +282,8 @@
+             EditCommand::InsertString(str) => self.insert_str(str),
+             EditCommand::InsertPair { open, close } => self.insert_pair(*open, *close),
+             EditCommand::InsertNewline => self.insert_newline(),
+-            EditCommand::InsertNewlineAbove => self.insert_newline_above(),
+-            EditCommand::InsertNewlineBelow => self.insert_newline_below(),
++            EditCommand::InsertNewlineAbove => self.open_line(Direction::Backward),
++            EditCommand::InsertNewlineBelow => self.open_line(Direction::Forward),
+             EditCommand::ReplaceChar(chr) => self.replace_char(*chr),
+             EditCommand::ReplaceChars(n_chars, str) => self.replace_chars(*n_chars, str),
+             EditCommand::Backspace => self.backspace(),
+@@ -566,15 +572,14 @@
+         // `sync_edit_mode` may have already adopted this policy without
+         // committing (a command-less transition), so `policy_changed` can read
+         // false here even though the cursor still owes a settle.
+-        if policy_changed || self.policy_unsettled {
++        if policy_changed || self.policy_unsettled() {
+             self.commit_cursor();
+         }
+     }
+ 
+-    /// Whether a rest-policy change is awaiting a commit (see
+-    /// [`policy_unsettled`](Self::policy_unsettled) field).
++    /// Whether a rest-policy change is awaiting a commit.
+     pub(crate) fn policy_unsettled(&self) -> bool {
+-        self.policy_unsettled
++        self.previous_rest_policy.is_some()
+     }
+ 
+     /// Set whether a block-caret left/right motion crosses line terminators (see
+@@ -593,8 +598,9 @@
+     /// settled by the pre-paint `set_edit_mode`. Committing here would pull a
+     /// caret at the line end back a grapheme, double-stepping the Esc move.
+     pub fn sync_edit_mode(&mut self, mode: PromptEditMode) {
+-        if mode.rest_policy() != self.edit_mode.rest_policy() {
+-            self.policy_unsettled = true;
++        let previous = self.edit_mode.rest_policy();
++        if mode.rest_policy() != previous {
++            self.previous_rest_policy.get_or_insert(previous);
+         }
+         self.edit_mode = mode;
+     }
+@@ -611,7 +617,7 @@
+             self.edit_mode.rest_policy(),
+         );
+         self.line_buffer.set_cursor(committed);
+-        self.policy_unsettled = false;
++        self.previous_rest_policy = None;
+     }
+ 
+     /// Plain head move with no `put_cursor` geometry — retained only for test
+@@ -633,7 +639,21 @@
+         // Origin is the visible cursor position — `insertion_point()` already
+         // resolves that per policy (head for Between, caret for Block).
+         let origin = self.insertion_point();
++        // Helix `I` falls back to the start on blank lines; `gs` stays put.
++        if target == MotionTarget::LineStartNonBlank && self.entering_insert_from_helix_block() {
++            return line::first_non_blank(buf, origin)
++                .unwrap_or_else(|| line::start_of_line(buf, origin));
++        }
++
+         let head = resolve_motion(buf, origin, target, self.caret_geometry()).head;
++        // Helix `gl`/End land on the last content cell, not the newline.
++        // Bar-caret append instead uses the unadjusted line end.
++        if target == MotionTarget::LineEdge(Direction::Forward)
++            && self.edit_mode.rest_policy().covers_terminator()
++            && head > line::start_of_line(buf, origin)
++        {
++            return prev_grapheme_boundary(buf, head);
++        }
+         // Only a block-caret grapheme step needs a line policy at the edges; every
+         // other target's line-crossing is already fixed by `resolve_motion`, and a
+         // bar caret (`Between`) moves freely across the terminator either way.
+@@ -812,13 +832,23 @@
+         self.update_undo_state(undo_behavior);
+     }
+ 
++    fn entering_insert_from_helix_block(&self) -> bool {
++        self.edit_mode.rest_policy() == RestPolicy::Between
++            && self
++                .previous_rest_policy
++                .is_some_and(|policy| policy.covers_terminator())
++    }
++
+     pub(crate) fn insertion_point(&self) -> usize {
+-        // The visible / edit position is policy-dependent: a `Between` (bar)
+-        // cursor sits at the head; a `Block` cursor sits at the caret (its left
+-        // edge). This is the one place that distinction lives — motions, edits
+-        // and callers all read it from here.
++        // Helix's mode-switch commands read the still-intact block range
++        // before placing a bar cursor. The block's caret is the visible start
++        // position: its head may already be on the far side of a newline.
++        // Keep the range for commands that intentionally use its edges (`i`,
++        // `a`) or consume it (`c`). Placement still uses the new policy.
+         let cursor = self.line_buffer.cursor();
+-        if self.edit_mode.rest_policy() == RestPolicy::Between {
++        if self.edit_mode.rest_policy() == RestPolicy::Between
++            && !self.entering_insert_from_helix_block()
++        {
+             cursor.head()
+         } else {
+             cursor.caret(self.line_buffer.get_buffer())
+@@ -933,7 +963,7 @@
+     }
+ 
+     pub(crate) fn move_to_line_start(&mut self, select: bool) {
+-        self.move_head_to(self.line_buffer.line_start_index(), select);
++        self.apply_move(MotionTarget::LineEdge(Direction::Backward), select);
+     }
+ 
+     pub(crate) fn move_to_line_non_blank_start(&mut self, select: bool) {
+@@ -941,7 +971,7 @@
+     }
+ 
+     pub(crate) fn move_to_line_end(&mut self, select: bool) {
+-        self.move_head_to(self.line_buffer.find_current_line_end(), select);
++        self.apply_move(MotionTarget::LineEdge(Direction::Forward), select);
+     }
+ 
+     fn undo(&mut self) {
+@@ -1586,24 +1616,22 @@
+         self.line_buffer.insert_newline();
+     }
+ 
+-    /// Collapse first: `set_insertion_point` is `set_head`, so on an anchored
+-    /// cursor (every helix one) the stale anchor dragged the caret back onto
+-    /// the old line.
+-    fn insert_newline_above(&mut self) {
+-        self.clear_selection();
+-        let index = self.line_buffer.find_char_left('\n', false).unwrap_or(0);
+-        self.line_buffer.set_insertion_point(index);
+-        self.line_buffer.insert_newline();
+-    }
+-
+-    fn insert_newline_below(&mut self) {
+-        self.clear_selection();
+-        let index = self
+-            .line_buffer
+-            .find_char_right('\n', false)
+-            .unwrap_or(self.line_buffer.len());
+-        self.line_buffer.set_insertion_point(index);
++    /// Open at the current line's edge. Use a point so the old selection
++    /// cannot pull the caret away from the new line. In particular, opening
++    /// above inserts at the line start and leaves the caret before the LF,
++    /// even on the first line; it does not seek a preceding separator.
++    fn open_line(&mut self, direction: Direction) {
++        let origin = self.insertion_point();
++        let buf = self.get_buffer();
++        let edge = match direction {
++            Direction::Backward => line::start_of_line(buf, origin),
++            Direction::Forward => line::end_of_line(buf, origin),
++        };
++        self.line_buffer.set_cursor(Cursor::point(edge));
+         self.line_buffer.insert_newline();
++        if direction == Direction::Backward {
++            self.line_buffer.set_insertion_point(edge);
++        }
+     }
+ 
+     #[cfg(feature = "system_clipboard")]
+@@ -5521,8 +5549,8 @@
+         #[case(EditCommand::InsertNewlineBelow, 1)]
+         #[case(EditCommand::InsertNewlineAbove, 5)]
+         fn open_line_then_opens_above_stack(#[case] open: EditCommand, #[case] caret: usize) {
+-            // Opening N lines means one seeking open plus N-1 opens *above* it:
+-            // only the first has a line edge to find. See the negative case below.
++            // As in counted Helix open: adding subsequent lines above leaves
++            // the single insertion caret on the first blank line.
+             let mut editor = helix_editor("abc\ndef");
+             editor.line_buffer.set_cursor(Cursor::new(caret, caret + 1));
+             editor.run_edit_command(&open);
+@@ -5533,15 +5561,14 @@
+         }
+ 
+         #[test]
+-        fn repeating_open_below_does_not_stack() {
+-            // The second seek finds no `\n` past the blank line just made, so it
+-            // appends at the buffer end rather than stacking.
++        fn repeating_open_below_follows_the_blank_lines() {
+             let mut editor = helix_editor("abc\ndef");
+             editor.line_buffer.set_cursor(Cursor::new(1, 2));
+             for _ in 0..3 {
+                 editor.run_edit_command(&EditCommand::InsertNewlineBelow);
+             }
+-            assert_eq!(editor.get_buffer(), "abc\n\ndef\n\n");
++            assert_eq!(editor.get_buffer(), "abc\n\n\n\ndef");
++            assert_eq!(editor.insertion_point(), 6);
+         }
+ 
+         #[test]
+diff --git a/src/edit_mode/helix/mod.rs b/src/edit_mode/helix/mod.rs
+--- a/src/edit_mode/helix/mod.rs
++++ b/src/edit_mode/helix/mod.rs
+@@ -625,6 +625,11 @@
+ /// Lowers an `Action` onto `ReedlineEvent`
+ fn lower(action: Action, mode: HelixMode) -> ReedlineEvent {
+     let event = match action.verb {
++        // `I`/`A` place a new insertion point even when invoked from select
++        // mode. They resolve the line from the source caret, not the range end.
++        Verb::CollapsingMotion(target) if action.next_mode == Some(HelixMode::Insert) => {
++            action.repeated(EditCommand::Move(target))
++        }
+         // The two motion verbs differ only in what normal mode does with the
+         // span; select mode extends either way.
+         Verb::SelectingMotion(target) | Verb::CollapsingMotion(target) => match mode {
+@@ -651,11 +656,8 @@
+             Op::Lowercase => ReedlineEvent::Edit(vec![EditCommand::LowercaseSelection]),
+         },
+         Verb::Collapse(dir) => ReedlineEvent::Edit(vec![EditCommand::CollapseSelection(dir)]),
+-        // Only the first open seeks; the rest go *above* the blank line it just
+-        // made. A repeated `InsertNewlineBelow` would find no `\n` past that
+-        // line and append at the buffer end, and a plain `InsertNewline` would
+-        // delete the resting selection, which under `BlockOverNewline` always
+-        // covers a grapheme.
++        // Open the first line in the requested direction. Open the rest above
++        // it so the single insertion caret remains on the first blank line.
+         Verb::OpenLine(direction) => {
+             let first = match direction {
+                 Direction::Forward => EditCommand::InsertNewlineBelow,
+diff --git a/src/engine.rs b/src/engine.rs
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -6965,6 +6965,27 @@
+     }
+ 
+     #[test]
++    fn helix_line_insert_from_the_newline_block() {
++        for (command, expected) in [
++            ('I', "!abc\ndef"),
++            ('A', "abc!\ndef"),
++            ('o', "abc\n!\ndef"),
++            ('O', "!\nabc\ndef"),
++        ] {
++            let mut rl = seam_engine(Box::<crate::Helix>::default());
++            rl.editor
++                .set_buffer("abc\ndef".into(), UndoBehavior::CreateUndoPoint);
++            drive_until_signal(
++                &mut rl,
++                &[key(KeyCode::Esc), ch('g'), ch('g'), ch('3'), ch('l')],
++            );
++            assert_eq!(rl.editor.get_selection(), Some((3, 4)));
++            drive_until_signal(&mut rl, &[ch(command), ch('!')]);
++            assert_eq!(rl.editor.get_buffer(), expected, "{command}");
++        }
++    }
++
++    #[test]
+     fn with_edit_mode_builder_accepts_custom_helix_mode() {
+         use crate::PromptHelixMode;
+ 

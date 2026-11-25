@@ -22,6 +22,7 @@ fn keys(e: &mut Engine, spec: &str) -> Vec<Action> {
                 "up" => Key::named("up"),
                 "down" => Key::named("down"),
                 "home" => Key::named("home"),
+                "end" => Key::named("end"),
                 "lt" => Key::char('<'),
                 other => panic!("unknown key {other}"),
             }
@@ -104,6 +105,119 @@ fn open_line_below() {
     assert_eq!(e.snapshot().mode, "insert");
     keys(&mut e, "two");
     assert_eq!(buf(&e), "one\ntwo");
+}
+
+#[test]
+fn open_line_above_first_line() {
+    let mut e = engine("one");
+    keys(&mut e, "<esc>O");
+    let opened = e.snapshot();
+    assert_eq!(opened.mode, "insert");
+    assert_eq!(opened.buffer, "\none");
+    assert_eq!(opened.cursor, 0);
+    keys(&mut e, "two");
+    assert_eq!(buf(&e), "two\none");
+}
+
+#[test]
+fn open_line_above_later_line() {
+    let mut e = engine("one\nthree");
+    keys(&mut e, "<esc>Otwo");
+    assert_eq!(buf(&e), "one\ntwo\nthree");
+}
+
+#[test]
+fn line_insert_commands_target_the_line_that_owns_the_newline() {
+    for (command, cursor, expected) in [
+        ("I", 0, "!abc\ndef"),
+        ("A", 3, "abc!\ndef"),
+        ("o", 4, "abc\n!\ndef"),
+        ("O", 0, "!\nabc\ndef"),
+        // The LF is still a selectable cell: `i` and `a` use its opposite edges.
+        ("i", 3, "abc!\ndef"),
+        ("a", 4, "abc\n!def"),
+        ("c", 3, "abc!def"),
+    ] {
+        let mut e = engine("abc\ndef");
+        keys(&mut e, "<esc>gg3l");
+        assert_eq!(e.snapshot().selection, Some((3, 4)));
+        keys(&mut e, command);
+        let inserted = e.snapshot();
+        assert_eq!(inserted.mode, "insert", "{command}");
+        assert_eq!(inserted.cursor, cursor, "{command}");
+        assert_eq!(inserted.selection, None, "{command}");
+        keys(&mut e, "!");
+        assert_eq!(buf(&e), expected, "{command}");
+    }
+}
+
+#[test]
+fn line_motions_target_the_line_that_owns_the_newline() {
+    for (command, cursor, selection) in [
+        ("<home>", 0, (0, 1)),
+        ("gh", 0, (0, 1)),
+        ("<end>", 2, (2, 3)),
+        ("gl", 2, (2, 3)),
+        ("v<home>", 0, (0, 4)),
+        ("v<end>", 2, (2, 4)),
+        ("vgl", 2, (2, 4)),
+    ] {
+        let mut e = engine("abc\ndef");
+        keys(&mut e, "<esc>gg3l");
+        keys(&mut e, command);
+        assert_eq!(e.snapshot().cursor, cursor, "{command}");
+        assert_eq!(e.snapshot().selection, Some(selection), "{command}");
+    }
+}
+
+#[test]
+fn line_insert_commands_handle_blank_lines_and_multibyte_graphemes() {
+    for (text, setup, command, cursor, expected) in [
+        ("a\n  \nz", "gg4l", "I", 2, "a\n!  \nz"),
+        ("a\n\nz", "gg2l", "o", 3, "a\n\n!\nz"),
+        ("a\n\nz", "gg2l", "O", 2, "a\n!\n\nz"),
+        ("a\né\nz", "gg3l", "A", 4, "a\né!\nz"),
+        ("a\né\nz", "gg3l", "O", 2, "a\n!\né\nz"),
+        ("é\r\nz", "ggl", "A", 2, "é!\r\nz"),
+        ("abc\ndef", "ggv3l", "I", 0, "!abc\ndef"),
+        ("abc\ndef", "gg4lvh", "A", 3, "abc!\ndef"),
+    ] {
+        let mut e = engine(text);
+        keys(&mut e, "<esc>");
+        keys(&mut e, setup);
+        keys(&mut e, command);
+        assert_eq!(e.snapshot().cursor, cursor, "{text:?}: {setup}{command}");
+        keys(&mut e, "!");
+        assert_eq!(buf(&e), expected, "{text:?}: {setup}{command}");
+    }
+}
+
+#[test]
+fn counted_open_stacks_blank_lines_at_the_newline() {
+    for (command, expected) in [
+        ("3o", "abc\n!\n\n\ndef"),
+        ("3O", "!\n\n\nabc\ndef"),
+    ] {
+        let mut e = engine("abc\ndef");
+        keys(&mut e, "<esc>gg3l");
+        keys(&mut e, command);
+        keys(&mut e, "!");
+        assert_eq!(buf(&e), expected, "{command}");
+    }
+}
+
+#[test]
+fn first_non_blank_motion_stays_put_on_a_blank_line() {
+    let mut e = engine("a\n  \nz");
+    keys(&mut e, "<esc>gg3lgs");
+    assert_eq!(e.snapshot().cursor, 3);
+}
+
+#[test]
+fn insert_mode_end_lands_before_the_newline() {
+    let mut e = engine("abc\ndef");
+    keys(&mut e, "<esc>ggi<end>!");
+    assert_eq!(buf(&e), "abc!\ndef");
 }
 
 #[test]
